@@ -734,6 +734,193 @@ void advanced_inventory::redraw_pane( int i )
 
 }
 
+bool advanced_inventory::move_all_items()
+{
+    player &u = *p;
+    map &m = g->m;
+
+    bool filtering = ( !panes[src].filter.empty() );
+
+    // If the active screen has no item.
+    if( panes[src].size == 0 ) {
+        return false;
+    }
+
+    //update the dest variable
+    dest = (src == left ? right : left);
+    bool moveall = true;
+    int destarea = panes[dest].area;
+    if ( panes[dest].area == isall ) {
+        popup(_("You have to choose a destination area."));
+        return false;
+    }
+
+    if ( panes[src].area == isall) {
+        popup(_("You have to choose a source area."));
+        return false;
+    }
+
+    // is this panel not the player inventory?
+    if (panes[src].area == isinventory) {
+
+            // Handle moving from inventory
+
+    } else {
+
+        int p_x = u.posx + panes[src].offx;
+        int p_y = u.posy + panes[src].offy;
+        int part = panes[src].vstor;
+        vehicle *veh = panes[src].veh;
+        // by default, we want to iterate the items at a location
+        std::vector<item> &items_to_iterate = m.i_at(p_x,p_y);
+
+        // but if it's a vehicle, we'll want the items in the vehicle
+        if (panes[src].vstor >= 0) {
+            items_to_iterate = veh->parts[part].items;
+        }
+
+        for (std::vector<item>::iterator it = items_to_iterate.begin(); it != items_to_iterate.end(); /* noop */)
+        {
+            // if we're filtering, check if this item is in the filter. If it isn't, continue
+            if ( filtering && ! cached_lcmatch(it->name, panes[src].filter, panes[src].filtercache ) ) {
+                ++it;
+                continue;
+            }
+
+            g->add_msg("Item %s", it->name.c_str());
+            // Don't even try.
+            if (it->made_of(LIQUID)) {
+                ++it;
+                continue;
+            } else {
+                // if the item has charges, how many should we move?
+                long trycharges = -1;
+                // Picking up to inventory?
+                if (destarea == isinventory) {
+                    if (!u.can_pickup(true)) {
+                        return true;
+                    }
+                    if(squares[destarea].size >= MAX_ITEM_IN_SQUARE) {
+                        g->add_msg(_("You are carrying too many items."));
+                        return true;
+                    }
+                    // Ok, let's see. What is the volume and weight?
+
+                    int tryvolume = it->volume();   // this is the volume we're going to check
+                    int tryweight = it->weight();   // this is the weight we're going to check
+                    int amount = 1;                 // this is the amount of items we're moving
+                    // does this item have charges, and do we count by that?
+                    if (it->count_by_charges() && it->charges > 1) {
+                        amount = it->charges;
+                        int unitvolume = it->precise_unit_volume(); // get the exact volume per unit
+                        int unitweight = ( tryweight * 1000 ) / it->charges; // and the unit weight
+
+                        int max_vol = (u.volume_capacity() - u.volume_carried()) * 1000; // how much more can we carry (volume)
+                        int max_weight = (( u.weight_capacity() * 4 ) - u.weight_carried()) * 1000; // how much more can we carry (weight)
+                        int max = amount; // the max is the maximum we can pick up
+
+                        // we'll check and see how many items we can pick up in total, if the volume is above the max_vol
+                        if ( unitvolume > 0 && unitvolume * amount > max_vol ) {
+                            max = int( max_vol / unitvolume );
+                        }
+                        // we'll check and see how many items we can pick up in total, if the weight is above the max_weight
+                        if ( unitweight > 0 && unitweight * amount > max_weight ) {
+                            max = int( max_weight / unitweight );
+                        }
+
+                        // Can we pick this up at all?
+                        if (max != 0) {
+                            if ( amount != it->charges ) {
+                                tryvolume = ( unitvolume * amount ) / 1000;
+                                tryweight = ( unitweight * amount ) / 1000;
+                                trycharges = amount;
+                            }
+                            if ( trycharges == 0 ) {
+                                g->add_msg(_("Unable to pick up %s."),it->name.c_str());
+                                ++it;
+                                continue;
+                            }
+                        } else {
+                            g->add_msg(_("Unable to pick up %s."),it->name.c_str());
+                            ++it;
+                            continue;
+                        }
+                    }
+
+                    // We've already checked if we're trying to pick up a stack
+                    if(!u.can_pickVolume(tryvolume)) {
+                        g->add_msg(_("There's no room in your inventory for %s."),it->name.c_str());
+                        ++it;
+                        continue;
+                    } else if (!u.can_pickWeight(tryweight, false)) {
+                        g->add_msg(_("%s is too heavy."),it->name.c_str());
+                        ++it;
+                        continue;
+                    }
+                }
+                // We can move it!
+                item new_item = (*it);
+
+                // So, if there's are charges, we'll set the new item to this.
+                if ( trycharges > 0 ) {
+                    new_item.charges = trycharges;
+                }
+
+                // if it's an inventory, we'll have to let time pass, and move the item
+                // we also know that we can pick it up, we've calculated that above!
+                if(destarea == isinventory) {
+                    u.inv.assign_empty_invlet(new_item);
+                    u.i_add(new_item);
+                    u.moves -= 100;
+
+                // if it is a vehicle storage, try to move it there. If not, let's just continue
+                } else if (squares[destarea].vstor >= 0) {
+                    if( squares[destarea].veh->add_item( squares[destarea].vstor, new_item ) == false) {
+                        g->add_msg(_("Unable to move item, the destination is too full."));
+                        ++it;
+                        continue;
+                    }
+
+                // if it's a normal square, try to move it there. If not, just continue
+                } else {
+                    if ( m.add_item_or_charges(squares[destarea].x, squares[destarea].y, new_item, 0 ) == false ) {
+                        g->add_msg(_("Unable to move item, the destination is too full."));
+                        ++it;
+                        continue;
+                    }
+                }
+
+                // OK! Item is moved. Now deduct charges, or remove the item completely
+                if ( trycharges > 0 ) {
+                    it->charges -= trycharges;
+                    ++it;
+                    continue;
+                } else {
+                    // we'll need to remove the item here.
+                    if (panes[src].vstor >= 0) {
+                        // we need to erase the item from the vehicle part
+                        veh->remove_item(part, &*it);
+                    } else {
+                        items_to_iterate.erase(it);
+                    }
+                }
+            }
+        }
+    }
+    /*for (std::vector<advanced_inv_listitem>::iterator ait = panes[src].items.begin(); ait != panes[src].items.end(); ++ait)
+
+    {
+        int item_pos = panes[src].size > 0 ? ait->idx : 0;
+        g->add_msg("Item %s", ait->it->name.c_str());
+
+
+    }
+*/
+
+    return true; // passed, so let's continue
+
+}
+
 void advanced_inventory::display(player *pp)
 {
     init(pp);
@@ -1207,6 +1394,11 @@ void advanced_inventory::display(player *pp)
                     }
                 }
             }
+        } else if (',' == c) {
+            if (move_all_items()) {
+                exit = true;
+            }
+            redraw = true;
         } else if ('?' == c) {
             showmsg = (!showmsg);
             checkshowmsg = false;
